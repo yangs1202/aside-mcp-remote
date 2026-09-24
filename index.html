@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="description" content="A small Streamable HTTP bridge for the Aside MCP stdio server." />
+    <title>Aside MCP Remote</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", sans-serif;
+        background: #0b1020;
+        color: #e8ecff;
+      }
+      body { margin: 0; min-height: 100vh; display: grid; place-items: center; }
+      main {
+        width: min(720px, calc(100% - 40px));
+        padding: 40px;
+        border: 1px solid #2b3764;
+        border-radius: 24px;
+        background: linear-gradient(145deg, #151d3b, #0e1429);
+        box-shadow: 0 24px 80px #0008;
+      }
+      .eyebrow { color: #8ea2ff; letter-spacing: .12em; text-transform: uppercase; font-size: 12px; }
+      h1 { margin: 10px 0 12px; font-size: clamp(32px, 7vw, 58px); }
+      p { color: #b7c0e5; line-height: 1.6; }
+      .status { margin-top: 28px; display: flex; gap: 12px; align-items: center; }
+      .dot { width: 12px; height: 12px; border-radius: 50%; background: #41e39a; box-shadow: 0 0 18px #41e39a; }
+      code { color: #d9c6ff; }
+      button { margin-top: 22px; border: 0; border-radius: 12px; padding: 12px 16px; background: #7790ff; color: #07102e; font-weight: 700; cursor: pointer; }
+      button:hover { background: #9badff; }
+      #result { min-height: 24px; color: #8ff0bd; }
+      .endpoint { margin-top: 24px; padding: 16px; border-radius: 12px; background: #080d1b; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <div class="eyebrow">Open source MCP bridge</div>
+      <h1>Aside MCP Remote</h1>
+      <p>Expose the local <code>aside mcp</code> stdio server through a standard Streamable HTTP endpoint.</p>
+      <div class="status"><span class="dot"></span><span>HTTP server is running · <code id="origin"></code></span></div>
+      <div class="endpoint"><code id="mcp"></code></div>
+      <button id="check">Check server status</button>
+      <p id="result"></p>
+    </main>
+    <script>
+      const origin = document.querySelector("#origin");
+      const mcp = document.querySelector("#mcp");
+      const result = document.querySelector("#result");
+      origin.textContent = location.origin;
+      mcp.textContent = `${location.origin}/mcp`;
+      document.querySelector("#check").addEventListener("click", async () => {
+        result.textContent = "Checking...";
+        const response = await fetch("/api/status");
+        const data = await response.json();
+        result.textContent = `${data.message} · ${data.mcp} · sessions: ${data.mcp_sessions}`;
+      });
+    </script>
+  </body>
+</html>
