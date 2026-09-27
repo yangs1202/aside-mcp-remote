@@ -135,6 +135,25 @@ class TasksApiTest(unittest.TestCase):
         self.assertEqual(body["taskId"], "ses_done01")
         self.assertEqual(body["status"], "succeeded")
         self.assertEqual(body["result"], "서울은 맑습니다.")
+        self.assertEqual(body["raw"], "서울은 맑습니다.")
+
+    def test_get_extracts_final_text_and_keeps_raw_message(self):
+        raw = json.dumps(
+            [
+                {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "2026년 9월 27일 (일) 저녁 7시 30분 KST."}],
+                }
+            ],
+            ensure_ascii=False,
+        )
+        with self.temporary_state() as database:
+            self.insert_session(database, "ses_raw001", "idle", finished_at=10, result=raw)
+            with mock.patch.object(server, "state_db_path", return_value=database):
+                with self.request("/v1/tasks/ses_raw001") as response:
+                    body = json.loads(response.read())
+        self.assertEqual(body["result"], "2026년 9월 27일 (일) 저녁 7시 30분 KST.")
+        self.assertEqual(body["raw"], raw)
 
     def test_missing_task_returns_not_found(self):
         with self.temporary_state() as database:

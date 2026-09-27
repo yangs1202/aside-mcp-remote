@@ -398,9 +398,12 @@ def task_payload(session: sqlite3.Row, turn: Optional[sqlite3.Row]) -> Dict[str,
         "updatedAt": session["updated_at"],
     }
     if status in {"succeeded", "failed", "interrupted"} and turn is not None:
-        result = turn["final_assistant_message"]
-        if isinstance(result, str) and result:
-            payload["result"] = result
+        raw = turn["final_assistant_message"]
+        if isinstance(raw, str) and raw:
+            payload["raw"] = raw
+            result = final_result_text(raw)
+            if result:
+                payload["result"] = result
         error = task_error(turn["abort_reason"])
         if error and status != "succeeded":
             payload["error"] = error
@@ -443,6 +446,19 @@ def message_text(content: Any) -> str:
                     parts.append(text)
         return "\n".join(parts)
     return str(content) if content is not None else ""
+
+
+def final_result_text(raw: str) -> str:
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return raw
+    if isinstance(parsed, list):
+        parts = [message_text(item.get("content")) for item in parsed if isinstance(item, dict)]
+        return "\n".join(part for part in parts if part)
+    if isinstance(parsed, dict):
+        return message_text(parsed.get("content", parsed.get("text", raw)))
+    return raw
 
 
 def messages_to_prompt(messages: Any) -> str:

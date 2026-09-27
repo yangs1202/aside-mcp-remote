@@ -135,7 +135,8 @@ curl http://127.0.0.1:8766/v1/tasks/ses_01HQ7B
 ```
 
 The status response uses `running`, `succeeded`, `failed`, or `interrupted`.
-`succeeded` includes Aside's final text in `result`. Pass `account` in the
+`succeeded` includes the extracted final text in `result` and Aside's stored
+message in `raw`. Pass `account` in the
 create body, or `?account=u1` on the status request, when the task belongs to
 a non-default Aside profile.
 
