@@ -9,6 +9,7 @@ import queue
 import re
 import shutil
 import signal
+import sqlite3
 import subprocess
 import threading
 import time
@@ -31,6 +32,13 @@ OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "aside-browser")
 OPENAI_PROGRESS_MESSAGE = os.environ.get(
     "OPENAI_PROGRESS_MESSAGE", "요청을 처리하고 있어요."
 )
+TASK_START_TIMEOUT = float(os.environ.get("TASK_START_TIMEOUT_SECONDS", "30"))
+ASIDE_STATE_DIR = Path(
+    os.environ.get("ASIDE_STATE_DIR", str(Path.home() / ".aside" / "u"))
+)
+SESSION_ID_RE = re.compile(r"created new session:\s*(\S+)")
+ACTIVE_SESSION_STATUSES = {"running", "queued", "streaming"}
+FAILED_SESSION_STATUSES = {"errored", "aborted"}
 
 
 def aside_command() -> str:
@@ -266,6 +274,153 @@ def call_aside_exec(prompt: str, model: Optional[str] = None) -> str:
         session.close()
 
 
+def account_index(account: Optional[str]) -> int:
+    selected = account if account is not None else os.environ.get("ASIDE_ACCOUNT", "u0")
+    if not re.fullmatch(r"u\d+", selected):
+        raise ValueError("account must look like u0")
+    return int(selected[1:])
+
+
+def state_db_path(account: Optional[str] = None) -> Path:
+    return ASIDE_STATE_DIR / str(account_index(account)) / "state.db"
+
+
+def strip_ansi(value: str) -> str:
+    return re.sub(r"\[[0-9;]*m", "", value)
+
+
+class TaskStartError(RuntimeError):
+    pass
+
+
+def start_aside_exec(prompt: str, account: Optional[str] = None) -> str:
+    if not isinstance(prompt, str) or not prompt.strip():
+        raise ValueError("prompt is required")
+    command = [aside_command(), "exec", prompt]
+    if account:
+        if not re.fullmatch(r"u\d+", account):
+            raise ValueError("account must look like u0")
+        command[1:1] = ["--account", account]
+    process = subprocess.Popen(
+        command,
+        cwd=str(ROOT),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+        bufsize=1,
+    )
+    assert process.stderr is not None
+    deadline = time.monotonic() + TASK_START_TIMEOUT
+    captured = ""
+    while time.monotonic() < deadline:
+        line = process.stderr.readline()
+        if line:
+            captured += line
+            match = SESSION_ID_RE.search(strip_ansi(line))
+            if match:
+                threading.Thread(
+                    target=_drain_task_process,
+                    args=(process,),
+                    daemon=True,
+                ).start()
+                return match.group(1)
+        elif process.poll() is not None:
+            remainder = process.stderr.read() or ""
+            captured += remainder
+            match = SESSION_ID_RE.search(strip_ansi(captured))
+            if match:
+                return match.group(1)
+            detail = strip_ansi(captured).strip() or f"aside exec exited {process.returncode}"
+            raise TaskStartError(detail)
+        else:
+            time.sleep(0.02)
+    process.terminate()
+    raise TimeoutError("aside exec did not return a session id")
+
+
+def _drain_task_process(process: subprocess.Popen) -> None:
+    try:
+        if process.stderr is not None:
+            process.stderr.read()
+        process.wait()
+    except Exception:
+        process.kill()
+
+
+def read_task(task_id: str, account: Optional[str] = None) -> Dict[str, Any]:
+    if not re.fullmatch(r"[A-Za-z0-9_-]{8,64}", task_id):
+        raise ValueError("invalid task id")
+    database = state_db_path(account)
+    if not database.is_file():
+        raise FileNotFoundError("Aside session state is not available")
+    uri = f"file:{database}?mode=ro"
+    connection = sqlite3.connect(uri, uri=True, timeout=1)
+    try:
+        connection.row_factory = sqlite3.Row
+        session = connection.execute(
+            "SELECT id, status, updated_at FROM sessions WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if session is None:
+            raise LookupError(task_id)
+        turn = connection.execute(
+            """
+            SELECT final_assistant_message, abort_reason, finished_at, aborted_at
+            FROM session_turns
+            WHERE session_id = ?
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (task_id,),
+        ).fetchone()
+    finally:
+        connection.close()
+    return task_payload(session, turn)
+
+
+def task_payload(session: sqlite3.Row, turn: Optional[sqlite3.Row]) -> Dict[str, Any]:
+    aside_status = str(session["status"])
+    finished = bool(turn and turn["finished_at"])
+    aborted = bool(turn and turn["aborted_at"])
+    if aside_status in ACTIVE_SESSION_STATUSES or (not finished and aside_status == "idle"):
+        status = "running"
+    elif aside_status in FAILED_SESSION_STATUSES or aborted:
+        status = "failed"
+    elif aside_status == "interrupted":
+        status = "interrupted"
+    else:
+        status = "succeeded"
+    payload: Dict[str, Any] = {
+        "taskId": session["id"],
+        "status": status,
+        "asideStatus": aside_status,
+        "updatedAt": session["updated_at"],
+    }
+    if status in {"succeeded", "failed", "interrupted"} and turn is not None:
+        result = turn["final_assistant_message"]
+        if isinstance(result, str) and result:
+            payload["result"] = result
+        error = task_error(turn["abort_reason"])
+        if error and status != "succeeded":
+            payload["error"] = error
+    return payload
+
+
+def task_error(abort_reason: Any) -> Optional[str]:
+    if not isinstance(abort_reason, str) or not abort_reason:
+        return None
+    try:
+        parsed = json.loads(abort_reason)
+    except json.JSONDecodeError:
+        return abort_reason
+    if isinstance(parsed, dict):
+        error = parsed.get("error") or parsed.get("message")
+        if isinstance(error, str) and error:
+            return error
+    return abort_reason
+
+
 def extract_tool_text(result: Dict[str, Any]) -> str:
     parts = []
     for item in result.get("content", []) or []:
@@ -478,11 +633,13 @@ class Handler(SimpleHTTPRequestHandler):
         self.end_headers()
 
     def do_OPTIONS(self) -> None:
-        if urlsplit(self.path).path not in {
+        path = urlsplit(self.path).path
+        if path not in {
             "/mcp",
             "/v1/models",
             "/v1/chat/completions",
-        }:
+            "/v1/tasks",
+        } and not path.startswith("/v1/tasks/"):
             self.send_error(HTTPStatus.NOT_FOUND)
             return
         self.send_response(HTTPStatus.NO_CONTENT)
@@ -502,6 +659,9 @@ class Handler(SimpleHTTPRequestHandler):
                     "mcp_sessions": session_count,
                 }
             )
+            return
+        if path.startswith("/v1/tasks/"):
+            self._handle_get_task()
             return
         if path == "/v1/models":
             if not self._authorized():
@@ -545,6 +705,9 @@ class Handler(SimpleHTTPRequestHandler):
         path = urlsplit(self.path).path
         if path == "/v1/chat/completions":
             self._handle_chat_completions()
+            return
+        if path == "/v1/tasks":
+            self._handle_create_task()
             return
         if path != "/mcp":
             self.send_error(HTTPStatus.NOT_FOUND)
@@ -647,6 +810,76 @@ class Handler(SimpleHTTPRequestHandler):
             )
             return
         self._send_mcp_response(response, session_id or "")
+
+    def _handle_create_task(self) -> None:
+        if not self._authorized():
+            self._send_openai_error("unauthorized", HTTPStatus.UNAUTHORIZED, "authentication_error")
+            return
+        try:
+            request = self._read_json()
+        except (ValueError, json.JSONDecodeError):
+            self._send_openai_error("invalid JSON")
+            return
+        if not isinstance(request, dict):
+            self._send_openai_error("request body must be an object")
+            return
+        account = request.get("account")
+        if account is not None and not isinstance(account, str):
+            self._send_openai_error("account must be a string")
+            return
+        try:
+            task_id = start_aside_exec(request.get("prompt"), account)
+        except ValueError as error:
+            self._send_openai_error(str(error))
+            return
+        except TimeoutError as error:
+            self._send_openai_error(str(error), HTTPStatus.GATEWAY_TIMEOUT, "timeout")
+            return
+        except Exception as error:
+            print(f"task start failed: {error}", flush=True)
+            self._send_openai_error(
+                "Aside Browser 작업을 시작하지 못했습니다.",
+                HTTPStatus.BAD_GATEWAY,
+                "upstream_error",
+            )
+            return
+        self._send_json({"taskId": task_id, "status": "running"}, HTTPStatus.ACCEPTED)
+
+    def _handle_get_task(self) -> None:
+        if not self._authorized():
+            self._send_openai_error("unauthorized", HTTPStatus.UNAUTHORIZED, "authentication_error")
+            return
+        task_id = urlsplit(self.path).path.removeprefix("/v1/tasks/")
+        if not task_id or "/" in task_id:
+            self._send_openai_error("invalid task id")
+            return
+        account = None
+        query = urlsplit(self.path).query
+        if query:
+            for part in query.split("&"):
+                key, _, value = part.partition("=")
+                if key == "account" and value:
+                    account = value
+        try:
+            payload = read_task(task_id, account)
+        except ValueError as error:
+            self._send_openai_error(str(error))
+            return
+        except LookupError:
+            self._send_openai_error("task not found", HTTPStatus.NOT_FOUND, "not_found")
+            return
+        except FileNotFoundError as error:
+            self._send_openai_error(str(error), HTTPStatus.BAD_GATEWAY, "upstream_error")
+            return
+        except sqlite3.Error as error:
+            print(f"task status failed: {error}", flush=True)
+            self._send_openai_error(
+                "Aside 작업 상태를 읽지 못했습니다.",
+                HTTPStatus.BAD_GATEWAY,
+                "upstream_error",
+            )
+            return
+        self._send_json(payload)
 
     def _handle_chat_completions(self) -> None:
         if not self._authorized():

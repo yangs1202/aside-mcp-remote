@@ -113,11 +113,37 @@ result is delivered as one completed chunk instead of token-by-token output.
 The adapter currently accepts chat messages and does not expose OpenAI
 function calling; browser work is performed through Aside's `exec` tool.
 
+## Tasks API
+
+Long-running browser work can be started without waiting for Aside to finish.
+`POST /v1/tasks` starts `aside exec` and returns the Aside session id as
+`taskId` as soon as the session is created. Poll `GET /v1/tasks/{taskId}` for
+the result. `/v1/chat/completions` remains synchronous.
+
+```sh
+curl http://127.0.0.1:8766/v1/tasks \
+  -H 'Content-Type: application/json' \
+  -d '{"prompt": "현재 서울 날씨를 확인해줘"}'
+```
+
+```json
+{"taskId": "ses_01HQ7B", "status": "running"}
+```
+
+```sh
+curl http://127.0.0.1:8766/v1/tasks/ses_01HQ7B
+```
+
+The status response uses `running`, `succeeded`, `failed`, or `interrupted`.
+`succeeded` includes Aside's final text in `result`. Pass `account` in the
+create body, or `?account=u1` on the status request, when the task belongs to
+a non-default Aside profile.
+
 ## Security
 
 This service is a protocol bridge, not an authentication boundary by itself.
 Do not commit tokens, browser profiles, cookies, memory files, logs, or `.env`
-files. `MCP_BEARER_TOKEN` protects both `/mcp` and `/v1`. Use HTTPS and a
+files. `MCP_BEARER_TOKEN` protects `/mcp`, `/v1/chat/completions`, and `/v1/tasks`. Use HTTPS and a
 non-empty token before exposing either endpoint beyond a trusted network.
 Keep the endpoint behind a reverse proxy with rate limits in production.
 
