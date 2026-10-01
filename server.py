@@ -8,6 +8,7 @@ import os
 import queue
 import re
 import shutil
+import signal
 import subprocess
 import threading
 import time
@@ -21,6 +22,8 @@ from urllib.parse import urlsplit
 
 ROOT = Path(__file__).resolve().parent
 MCP_REQUEST_TIMEOUT = float(os.environ.get("MCP_REQUEST_TIMEOUT_SECONDS", "180"))
+MCP_SESSION_TTL = float(os.environ.get("MCP_SESSION_TTL_SECONDS", "900"))
+MCP_MAX_SESSIONS = int(os.environ.get("MCP_MAX_SESSIONS", "64"))
 MCP_BEARER_TOKEN = os.environ.get("MCP_BEARER_TOKEN", "")
 MCP_CORS_ORIGIN = os.environ.get("MCP_CORS_ORIGIN", "")
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "aside-browser")
@@ -50,7 +53,8 @@ class AsideMcpSession:
             bufsize=1,
         )
         self.messages: queue.Queue = queue.Queue()
-        self.lock = threading.Lock()
+        self.lock = threading.RLock()
+        self.last_used = time.monotonic()
         self.reader = threading.Thread(target=self._read_messages, daemon=True)
         self.reader.start()
 
@@ -66,6 +70,13 @@ class AsideMcpSession:
         self.messages.put(None)
 
     def request(self, message: Dict[str, object]) -> Dict[str, object]:
+        with self.lock:
+            try:
+                return self._request(message)
+            finally:
+                self.last_used = time.monotonic()
+
+    def _request(self, message: Dict[str, object]) -> Dict[str, object]:
         if self.process.poll() is not None:
             raise RuntimeError("aside mcp process is not running")
         assert self.process.stdin is not None
@@ -84,6 +95,13 @@ class AsideMcpSession:
                     return response
 
     def notify(self, message: Dict[str, object]) -> None:
+        with self.lock:
+            try:
+                self._notify(message)
+            finally:
+                self.last_used = time.monotonic()
+
+    def _notify(self, message: Dict[str, object]) -> None:
         if self.process.poll() is not None:
             raise RuntimeError("aside mcp process is not running")
         assert self.process.stdin is not None
@@ -98,6 +116,11 @@ class AsideMcpSession:
                 self.process.wait(timeout=3)
             except subprocess.TimeoutExpired:
                 self.process.kill()
+                self.process.wait()
+        self.reader.join(timeout=3)
+        for pipe in (self.process.stdin, self.process.stdout):
+            if pipe is not None:
+                pipe.close()
 
 
 def initialize_aside_session(client_name: str) -> AsideMcpSession:
@@ -269,7 +292,26 @@ def get_session(session_id: Optional[str]) -> Optional[AsideMcpSession]:
     if not session_id:
         return None
     with sessions_lock:
-        return sessions.get(session_id)
+        session = sessions.get(session_id)
+        if session is not None:
+            session.last_used = time.monotonic()
+        return session
+
+
+def reap_sessions() -> None:
+    expired = []
+    with sessions_lock:
+        for session_id, session in list(sessions.items()):
+            if not session.lock.acquire(blocking=False):
+                continue
+            try:
+                if (session.process.poll() is not None or
+                        time.monotonic() - session.last_used >= MCP_SESSION_TTL):
+                    expired.append(sessions.pop(session_id))
+            finally:
+                session.lock.release()
+    for session in expired:
+        session.close()
 
 
 class Handler(SimpleHTTPRequestHandler):
@@ -433,9 +475,19 @@ class Handler(SimpleHTTPRequestHandler):
         session = get_session(session_id)
         if method == "initialize" and session is None:
             session_id = uuid.uuid4().hex
-            session = AsideMcpSession()
-            with sessions_lock:
-                sessions[session_id] = session
+            reap_sessions()
+            try:
+                with sessions_lock:
+                    if len(sessions) >= MCP_MAX_SESSIONS:
+                        self._send_json({"error": "MCP session capacity reached; retry later"},
+                                        HTTPStatus.SERVICE_UNAVAILABLE)
+                        return
+                    session = AsideMcpSession()
+                    sessions[session_id] = session
+            except OSError:
+                self._send_json({"error": "Unable to start MCP process; retry later"},
+                                HTTPStatus.SERVICE_UNAVAILABLE)
+                return
             try:
                 response = session.request(message)
             except Exception as error:
@@ -475,6 +527,7 @@ class Handler(SimpleHTTPRequestHandler):
         try:
             response = session.request(message)
         except TimeoutError as error:
+            close_session(session_id or "")
             self._send_json(
                 {
                     "jsonrpc": "2.0",
@@ -617,6 +670,9 @@ class Server(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
 
+    def service_actions(self) -> None:
+        reap_sessions()
+
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -624,6 +680,10 @@ def main() -> None:
     parser.add_argument("--port", type=int, default=int(os.environ.get("PORT", "8766")))
     args = parser.parse_args()
 
+    def stop_service(signum, frame):
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGTERM, stop_service)
     os.chdir(ROOT)
     server = Server((args.host, args.port), Handler)
     print(f"Aside MCP Remote listening on {args.host}:{args.port}", flush=True)
