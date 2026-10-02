@@ -130,6 +130,10 @@ MIT. See [LICENSE](LICENSE).
 Idle MCP sessions expire after 15 minutes (`MCP_SESSION_TTL_SECONDS`, default
 `900`). Requests in progress are protected from idle cleanup. Clients must
 initialize a new session after expiration. At most 64 HTTP MCP sessions are
-retained (`MCP_MAX_SESSIONS`); additional initializations receive HTTP 503
-and should retry later. Timeout and explicit DELETE close the child process
+retained (`MCP_MAX_SESSIONS`). At capacity, the least recently used session
+idle for at least 60 seconds (`MCP_SESSION_PRESSURE_IDLE_SECONDS`) is closed
+before admitting a new connection. Running requests and recently used sessions
+are protected; HTTP 503 is returned only when no eligible session can be retired.
+Requests with an expired session ID receive HTTP 404 so clients can initialize
+a new session, as required by the MCP transport protocol. Timeout and explicit DELETE close the child process
 and its pipes. SIGTERM also cleans up retained sessions.

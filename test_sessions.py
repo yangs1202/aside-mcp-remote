@@ -82,3 +82,62 @@ class SessionLifecycleTest(unittest.TestCase):
             httpd.shutdown()
             httpd.server_close()
             thread.join()
+
+    def test_capacity_retires_oldest_idle_session(self):
+        old = self.session(server.MCP_SESSION_PRESSURE_IDLE + 20)
+        newer = self.session(server.MCP_SESSION_PRESSURE_IDLE + 10)
+        server.sessions.update(newer=newer, old=old)
+        with mock.patch.object(server, 'MCP_MAX_SESSIONS', 2):
+            with server.sessions_lock:
+                self.assertTrue(server.make_session_room())
+        self.assertEqual(list(server.sessions), ['newer'])
+        old.close.assert_called_once()
+        newer.close.assert_not_called()
+
+    def test_capacity_preserves_recent_and_busy_sessions(self):
+        recent = self.session()
+        busy = self.session(server.MCP_SESSION_PRESSURE_IDLE + 20)
+        server.sessions.update(recent=recent, busy=busy)
+        ready, release = threading.Event(), threading.Event()
+        def hold():
+            with busy.lock:
+                ready.set()
+                release.wait(5)
+        thread = threading.Thread(target=hold)
+        thread.start()
+        self.assertTrue(ready.wait(2))
+        try:
+            with mock.patch.object(server, 'MCP_MAX_SESSIONS', 2):
+                with server.sessions_lock:
+                    self.assertFalse(server.make_session_room())
+            busy.close.assert_not_called()
+            recent.close.assert_not_called()
+        finally:
+            release.set()
+            thread.join()
+
+    def test_expired_session_http_404_allows_reinitialization(self):
+        import json
+        import urllib.error
+        import urllib.request
+        httpd = server.Server(('127.0.0.1', 0), server.Handler)
+        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        thread.start()
+        try:
+            for method, rpc_method, expected in [('POST', 'tools/list', 404),
+                                                ('POST', 'initialize', 404),
+                                                ('DELETE', None, 404)]:
+                payload = json.dumps({'jsonrpc': '2.0', 'id': 1, 'method': rpc_method}).encode()
+                request = urllib.request.Request(
+                    f'http://127.0.0.1:{httpd.server_port}/mcp',
+                    data=payload if method == 'POST' else None,
+                    headers={'Content-Type': 'application/json', 'Mcp-Session-Id': 'expired'},
+                    method=method)
+                with self.assertRaises(urllib.error.HTTPError) as error:
+                    urllib.request.urlopen(request, timeout=5)
+                self.assertEqual(error.exception.code, expected)
+                error.exception.close()
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+            thread.join()

@@ -23,6 +23,7 @@ from urllib.parse import urlsplit
 ROOT = Path(__file__).resolve().parent
 MCP_REQUEST_TIMEOUT = float(os.environ.get("MCP_REQUEST_TIMEOUT_SECONDS", "180"))
 MCP_SESSION_TTL = float(os.environ.get("MCP_SESSION_TTL_SECONDS", "900"))
+MCP_SESSION_PRESSURE_IDLE = float(os.environ.get("MCP_SESSION_PRESSURE_IDLE_SECONDS", "60"))
 MCP_MAX_SESSIONS = int(os.environ.get("MCP_MAX_SESSIONS", "64"))
 MCP_BEARER_TOKEN = os.environ.get("MCP_BEARER_TOKEN", "")
 MCP_CORS_ORIGIN = os.environ.get("MCP_CORS_ORIGIN", "")
@@ -298,6 +299,26 @@ def get_session(session_id: Optional[str]) -> Optional[AsideMcpSession]:
         return session
 
 
+def make_session_room() -> bool:
+    """Called with sessions_lock held; retire the oldest idle session at capacity."""
+    if len(sessions) < MCP_MAX_SESSIONS:
+        return True
+    for session_id, session in sorted(sessions.items(), key=lambda item: item[1].last_used):
+        if not session.lock.acquire(blocking=False):
+            continue
+        try:
+            if time.monotonic() - session.last_used < MCP_SESSION_PRESSURE_IDLE:
+                continue
+            sessions.pop(session_id)
+            # Reclaim pipes before admitting another subprocess.
+            session.close()
+            print("MCP capacity: retired idle session", flush=True)
+            return True
+        finally:
+            session.lock.release()
+    return False
+
+
 def reap_sessions() -> None:
     expired = []
     with sessions_lock:
@@ -441,6 +462,9 @@ class Handler(SimpleHTTPRequestHandler):
         if not session_id:
             self.send_error(HTTPStatus.BAD_REQUEST, "Mcp-Session-Id is required")
             return
+        if get_session(session_id) is None:
+            self._send_json({"error": "MCP session not found"}, HTTPStatus.NOT_FOUND)
+            return
         close_session(session_id)
         self.send_response(HTTPStatus.NO_CONTENT)
         self.send_header("Content-Length", "0")
@@ -473,12 +497,16 @@ class Handler(SimpleHTTPRequestHandler):
         method = message.get("method")
         session_id = self.headers.get("Mcp-Session-Id")
         session = get_session(session_id)
+        if session_id and session is None:
+            self._send_json({"error": "MCP session expired; initialize a new session"},
+                            HTTPStatus.NOT_FOUND)
+            return
         if method == "initialize" and session is None:
             session_id = uuid.uuid4().hex
             reap_sessions()
             try:
                 with sessions_lock:
-                    if len(sessions) >= MCP_MAX_SESSIONS:
+                    if not make_session_room():
                         self._send_json({"error": "MCP session capacity reached; retry later"},
                                         HTTPStatus.SERVICE_UNAVAILABLE)
                         return
