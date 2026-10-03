@@ -154,6 +154,64 @@ def initialize_aside_session(client_name: str) -> AsideMcpSession:
         raise
 
 
+def read_catalog_json(path: Path) -> Dict[str, Any]:
+    try:
+        value = json.loads(path.read_text())
+        return value if isinstance(value, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def available_models() -> list:
+    aside_home = Path(os.environ.get("ASIDE_HOME", str(Path.home() / ".aside")))
+    accounts = read_catalog_json(aside_home / "accounts.json")
+    account_id = accounts.get("currentAccountId", 0)
+    # Account IDs are directory indices, not arbitrary paths.
+    if not isinstance(account_id, int) or account_id < 0:
+        account_id = 0
+    account_dir = aside_home / "u" / str(account_id)
+    providers = read_catalog_json(account_dir / "models.json").get("providers", {})
+    cached = read_catalog_json(account_dir / "cache" / "models-catalog.json")
+    result = {OPENAI_MODEL: {"id": OPENAI_MODEL, "object": "model",
+                            "created": 0, "owned_by": "aside"}}
+
+    def add(provider: str, model: Any) -> None:
+        if not isinstance(model, dict) or model.get("type", "chat") != "chat":
+            return
+        model_id = model.get("id")
+        if not isinstance(model_id, str) or not model_id:
+            return
+        full_id = f"{provider}/{model_id}"
+        try:
+            selected_model(full_id)
+        except ValueError:
+            return
+        entry = {"id": full_id, "object": "model", "created": 0, "owned_by": provider}
+        if isinstance(model.get("name"), str):
+            entry["name"] = model["name"]
+        result[full_id] = entry
+
+    if isinstance(providers, dict):
+        for provider, config in providers.items():
+            if not isinstance(config, dict):
+                continue
+            configured = config.get("models", [])
+            if isinstance(configured, list):
+                for model in configured:
+                    add(provider, model)
+            # OAuth catalogs are scoped to this account. Intersect with the
+            # provider catalog so internal/non-chat model IDs are not exposed.
+            account_catalog = config.get("accountModelCatalog", {})
+            allowed = account_catalog.get("modelIds", []) if isinstance(account_catalog, dict) else []
+            provider_cache = cached.get(provider, {})
+            models = provider_cache.get("models", []) if isinstance(provider_cache, dict) else []
+            if isinstance(allowed, list) and isinstance(models, list):
+                for model in models:
+                    if isinstance(model, dict) and model.get("id") in allowed:
+                        add(provider, model)
+    return list(result.values())
+
+
 def selected_model(value: Any) -> Optional[str]:
     if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,199}", value):
         raise ValueError("model must be a model ID or provider/model ID")
@@ -449,20 +507,7 @@ class Handler(SimpleHTTPRequestHandler):
             if not self._authorized():
                 self._send_openai_error("unauthorized", HTTPStatus.UNAUTHORIZED, "authentication_error")
                 return
-            now = int(time.time())
-            self._send_json(
-                {
-                    "object": "list",
-                    "data": [
-                        {
-                            "id": OPENAI_MODEL,
-                            "object": "model",
-                            "created": now,
-                            "owned_by": "aside",
-                        }
-                    ],
-                }
-            )
+            self._send_json({"object": "list", "data": available_models()})
             return
         if path == "/mcp":
             self.send_response(HTTPStatus.METHOD_NOT_ALLOWED)

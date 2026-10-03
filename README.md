@@ -143,8 +143,13 @@ and its pipes. SIGTERM also cleans up retained sessions.
 `POST /v1/chat/completions` accepts an Aside model ID in `model`, including
 `provider/model` IDs. `aside-browser` (or omitting `model`) keeps the existing
 Aside default. Explicit models are passed to `aside exec --model` and must be
-available to the local Aside account. `/v1/models` advertises only the default
-alias; it does not enumerate provider models. Both streaming and non-streaming
+available to the local Aside account. `/v1/models` includes the default alias and models registered in the current
+Aside account: configured provider models plus account-authorized chat models
+from the local provider catalog. It reads the local Aside configuration on each
+request, so configuration changes appear without restarting the bridge. This
+is a local catalog, not a live provider availability check. Missing or unreadable
+catalogs fall back to the default alias. `ASIDE_HOME` overrides `~/.aside` for
+catalog discovery. Credentials and provider URLs are never included in responses. Both streaming and non-streaming
 responses report the requested model. Streaming still sends a progress chunk
 followed by the completed answer.
 
