@@ -69,16 +69,16 @@ class OpenAIAdapterTest(unittest.TestCase):
         self.assertIn("결과입니다.", body)
         self.assertTrue(body.endswith("data: [DONE]\n\n"))
 
-    def test_unknown_model_is_rejected(self):
+    def test_invalid_model_is_rejected(self):
         with self.assertRaises(urllib.error.HTTPError) as context:
             self.request(
                 "/v1/chat/completions",
                 {
-                    "model": "unknown",
+                    "model": "--invalid",
                     "messages": [{"role": "user", "content": "안녕"}],
                 },
             )
-        self.assertEqual(context.exception.code, 404)
+        self.assertEqual(context.exception.code, 400)
 
 
 if __name__ == "__main__":

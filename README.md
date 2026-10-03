@@ -137,3 +137,22 @@ are protected; HTTP 503 is returned only when no eligible session can be retired
 Requests with an expired session ID receive HTTP 404 so clients can initialize
 a new session, as required by the MCP transport protocol. Timeout and explicit DELETE close the child process
 and its pipes. SIGTERM also cleans up retained sessions.
+
+## Select an execution model
+
+`POST /v1/chat/completions` accepts an Aside model ID in `model`, including
+`provider/model` IDs. `aside-browser` (or omitting `model`) keeps the existing
+Aside default. Explicit models are passed to `aside exec --model` and must be
+available to the local Aside account. `/v1/models` advertises only the default
+alias; it does not enumerate provider models. Both streaming and non-streaming
+responses report the requested model. Streaming still sends a progress chunk
+followed by the completed answer.
+
+```json
+{
+  "model": "opencodex/litellm/dgx-deepseek-v4-flash-0731",
+  "messages": [{"role": "user", "content": "Reply with OK."}]
+}
+```
+
+The model above is an example; availability depends on your account.

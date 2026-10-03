@@ -154,7 +154,32 @@ def initialize_aside_session(client_name: str) -> AsideMcpSession:
         raise
 
 
-def call_aside_exec(prompt: str) -> str:
+def selected_model(value: Any) -> Optional[str]:
+    if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,199}", value):
+        raise ValueError("model must be a model ID or provider/model ID")
+    return None if value == OPENAI_MODEL else value
+
+
+def call_aside_cli(prompt: str, model: str) -> str:
+    try:
+        result = subprocess.run(
+            [aside_command(), "exec", "--model", model, "--", prompt],
+            cwd=str(ROOT), stdin=subprocess.DEVNULL, capture_output=True,
+            text=True, timeout=MCP_REQUEST_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired as error:
+        raise TimeoutError("Aside model request timed out") from error
+    output = re.sub(r"\x1b\[[0-9;]*m", "", result.stdout).strip()
+    if result.returncode or re.search(r"(?m)^\s*•\s*Error\b", output):
+        raise RuntimeError(output or "Aside model request failed")
+    if not output:
+        raise RuntimeError("Aside model request returned no text")
+    return output
+
+
+def call_aside_exec(prompt: str, model: Optional[str] = None) -> str:
+    if model is not None:
+        return call_aside_cli(prompt, model)
     session = initialize_aside_session("aside-mcp-remote-openai")
     try:
         response = session.request(
@@ -592,12 +617,10 @@ class Handler(SimpleHTTPRequestHandler):
             return
 
         model = request.get("model", OPENAI_MODEL)
-        if model != OPENAI_MODEL:
-            self._send_openai_error(
-                f"model '{model}' is not available",
-                HTTPStatus.NOT_FOUND,
-                "model_not_found",
-            )
+        try:
+            execution_model = selected_model(model)
+        except ValueError as error:
+            self._send_openai_error(str(error))
             return
         if request.get("tools"):
             self._send_openai_error(
@@ -619,7 +642,7 @@ class Handler(SimpleHTTPRequestHandler):
         created = int(time.time())
         if not stream:
             try:
-                content = call_aside_exec(prompt)
+                content = call_aside_exec(prompt, execution_model)
             except TimeoutError as error:
                 self._send_openai_error(str(error), HTTPStatus.GATEWAY_TIMEOUT, "timeout")
                 return
@@ -631,7 +654,7 @@ class Handler(SimpleHTTPRequestHandler):
                     "upstream_error",
                 )
                 return
-            self._send_json(completion_payload(request_id, OPENAI_MODEL, content, created))
+            self._send_json(completion_payload(request_id, model, content, created))
             return
 
         self._send_sse_headers()
@@ -639,17 +662,17 @@ class Handler(SimpleHTTPRequestHandler):
             self._send_sse(
                 completion_chunk(
                     request_id,
-                    OPENAI_MODEL,
+                    model,
                     OPENAI_PROGRESS_MESSAGE,
                     created,
                 )
             )
-            content = call_aside_exec(prompt)
-            self._send_sse(completion_chunk(request_id, OPENAI_MODEL, content, created))
+            content = call_aside_exec(prompt, execution_model)
+            self._send_sse(completion_chunk(request_id, model, content, created))
             self._send_sse(
                 completion_chunk(
                     request_id,
-                    OPENAI_MODEL,
+                    model,
                     "",
                     created,
                     finish_reason="stop",
@@ -660,7 +683,7 @@ class Handler(SimpleHTTPRequestHandler):
             self._send_sse(
                 completion_chunk(
                     request_id,
-                    OPENAI_MODEL,
+                    model,
                     "Aside Browser 작업에 실패했습니다.",
                     created,
                 )
@@ -668,7 +691,7 @@ class Handler(SimpleHTTPRequestHandler):
             self._send_sse(
                 completion_chunk(
                     request_id,
-                    OPENAI_MODEL,
+                    model,
                     "",
                     created,
                     finish_reason="stop",
