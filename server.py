@@ -315,10 +315,18 @@ class TaskStartError(RuntimeError):
     pass
 
 
-def start_aside_exec(prompt: str, account: Optional[str] = None) -> str:
+def start_aside_exec(
+    prompt: str,
+    account: Optional[str] = None,
+    model: Optional[str] = None,
+) -> str:
     if not isinstance(prompt, str) or not prompt.strip():
         raise ValueError("prompt is required")
-    command = [aside_command(), "exec", prompt]
+    command = [aside_command(), "exec"]
+    if model is not None:
+        command.extend(["--model", model, "--", prompt])
+    else:
+        command.append(prompt)
     if account:
         if not re.fullmatch(r"u\d+", account):
             raise ValueError("account must look like u0")
@@ -1053,6 +1061,11 @@ class Handler(SimpleHTTPRequestHandler):
         if account and not re.fullmatch(r"u\d+", account):
             self._send_openai_error("account must look like u0")
             return
+        try:
+            execution_model = selected_model(request.get("model", OPENAI_MODEL))
+        except ValueError as error:
+            self._send_openai_error(str(error))
+            return
         prompt = request.get("prompt")
         if not isinstance(prompt, str) or not prompt.strip():
             self._send_openai_error("prompt is required")
@@ -1082,6 +1095,10 @@ class Handler(SimpleHTTPRequestHandler):
         elif host is not None:
             host = host.strip()
 
+        if execution_model is not None and (host is not None or "hosts" in request):
+            self._send_openai_error("model selection is only supported for local tasks")
+            return
+
         if "hosts" in request:
             tasks = self._start_tasks_on_hosts(prompt, account, hosts)
             if any(task["status"] == "running" for task in tasks):
@@ -1092,7 +1109,7 @@ class Handler(SimpleHTTPRequestHandler):
             return
         try:
             if host is None:
-                task_id = start_aside_exec(prompt, account)
+                task_id = start_aside_exec(prompt, account, execution_model)
             else:
                 task_id = start_host_task(prompt, account, host)
         except ValueError as error:
