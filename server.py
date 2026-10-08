@@ -18,7 +18,7 @@ from http import HTTPStatus
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Dict, Optional
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 
 ROOT = Path(__file__).resolve().parent
@@ -33,9 +33,16 @@ OPENAI_PROGRESS_MESSAGE = os.environ.get(
     "OPENAI_PROGRESS_MESSAGE", "요청을 처리하고 있어요."
 )
 TASK_START_TIMEOUT = float(os.environ.get("TASK_START_TIMEOUT_SECONDS", "30"))
+MAX_TASK_HOSTS = 20
 ASIDE_STATE_DIR = Path(
     os.environ.get("ASIDE_STATE_DIR", str(Path.home() / ".aside" / "u"))
 )
+HOST_TASK_STATE_DB = Path(
+    os.environ.get(
+        "HOST_TASK_STATE_DB",
+        str(Path.home() / ".aside-mcp-remote" / "tasks.db"),
+    )
+).expanduser()
 SESSION_ID_RE = re.compile(r"created new session:\s*(\S+)")
 ACTIVE_SESSION_STATUSES = {"running", "queued", "streaming"}
 FAILED_SESSION_STATUSES = {"errored", "aborted"}
@@ -49,11 +56,16 @@ def aside_command() -> str:
 
 
 class AsideMcpSession:
-    """Keep one local ``aside mcp`` stdio server per HTTP MCP session."""
+    """Keep one ``aside mcp`` stdio server per HTTP MCP session."""
 
-    def __init__(self) -> None:
+    def __init__(self, account: Optional[str] = None, host: Optional[str] = None) -> None:
+        command = [aside_command(), "mcp"]
+        if account:
+            command.extend(["--account", account])
+        if host is not None:
+            command.extend(["--host", host])
         self.process = subprocess.Popen(
-            [aside_command(), "mcp"],
+            command,
             cwd=str(ROOT),
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
@@ -132,8 +144,12 @@ class AsideMcpSession:
                 pipe.close()
 
 
-def initialize_aside_session(client_name: str) -> AsideMcpSession:
-    session = AsideMcpSession()
+def initialize_aside_session(
+    client_name: str,
+    account: Optional[str] = None,
+    host: Optional[str] = None,
+) -> AsideMcpSession:
+    session = AsideMcpSession(account, host)
     try:
         response = session.request(
             {
@@ -243,10 +259,15 @@ def call_aside_cli(prompt: str, model: str) -> str:
     return output
 
 
-def call_aside_exec(prompt: str, model: Optional[str] = None) -> str:
+def call_aside_exec(
+    prompt: str,
+    model: Optional[str] = None,
+    account: Optional[str] = None,
+    host: Optional[str] = None,
+) -> str:
     if model is not None:
         return call_aside_cli(prompt, model)
-    session = initialize_aside_session("aside-mcp-remote-openai")
+    session = initialize_aside_session("aside-mcp-remote-openai", account, host)
     try:
         response = session.request(
             {
@@ -339,6 +360,148 @@ def start_aside_exec(prompt: str, account: Optional[str] = None) -> str:
     raise TimeoutError("aside exec did not return a session id")
 
 
+def start_host_task(prompt: str, account: Optional[str], host: str) -> str:
+    task_id = f"host_{uuid.uuid4().hex}"
+    state: Dict[str, Any] = {
+        "taskId": task_id,
+        "status": "running",
+        "asideStatus": "running",
+        "host": host,
+        "updatedAt": int(time.time()),
+    }
+    save_host_task(state)
+    with host_tasks_lock:
+        host_tasks[task_id] = state
+    threading.Thread(
+        target=_run_host_task,
+        args=(task_id, prompt, account, host),
+        daemon=True,
+    ).start()
+    return task_id
+
+
+host_tasks: Dict[str, Dict[str, Any]] = {}
+host_tasks_lock = threading.Lock()
+
+
+def save_host_task(state: Dict[str, Any]) -> None:
+    HOST_TASK_STATE_DB.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    connection = sqlite3.connect(HOST_TASK_STATE_DB, timeout=1)
+    try:
+        connection.execute(
+            "CREATE TABLE IF NOT EXISTS host_tasks (task_id TEXT PRIMARY KEY, state TEXT NOT NULL)"
+        )
+        connection.execute(
+            "INSERT OR REPLACE INTO host_tasks (task_id, state) VALUES (?, ?)",
+            (state["taskId"], json.dumps(state, ensure_ascii=False)),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    HOST_TASK_STATE_DB.chmod(0o600)
+
+
+def read_host_task(task_id: str) -> Optional[Dict[str, Any]]:
+    with host_tasks_lock:
+        state = host_tasks.get(task_id)
+        if state is not None:
+            return dict(state)
+    if not HOST_TASK_STATE_DB.is_file():
+        return None
+    uri = HOST_TASK_STATE_DB.resolve().as_uri() + "?mode=ro"
+    connection = sqlite3.connect(uri, uri=True, timeout=1)
+    try:
+        row = connection.execute(
+            "SELECT state FROM host_tasks WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()
+    finally:
+        connection.close()
+    return json.loads(row[0]) if row is not None else None
+
+
+def initialize_host_task_store() -> None:
+    HOST_TASK_STATE_DB.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    connection = sqlite3.connect(HOST_TASK_STATE_DB, timeout=1)
+    try:
+        connection.execute(
+            "CREATE TABLE IF NOT EXISTS host_tasks (task_id TEXT PRIMARY KEY, state TEXT NOT NULL)"
+        )
+        rows = connection.execute("SELECT task_id, state FROM host_tasks").fetchall()
+        for task_id, encoded_state in rows:
+            state = json.loads(encoded_state)
+            if state.get("status") == "running":
+                state["status"] = "interrupted"
+                state["asideStatus"] = "interrupted"
+                state["error"] = "Aside MCP 서비스가 재시작되어 Host 작업 실행 상태를 잃었습니다."
+                state["updatedAt"] = int(time.time())
+                connection.execute(
+                    "UPDATE host_tasks SET state = ? WHERE task_id = ?",
+                    (json.dumps(state, ensure_ascii=False), task_id),
+                )
+        connection.commit()
+    finally:
+        connection.close()
+    HOST_TASK_STATE_DB.chmod(0o600)
+
+
+def _run_host_task(task_id: str, prompt: str, account: Optional[str], host: str) -> None:
+    try:
+        result = call_aside_exec(prompt, account=account, host=host)
+    except Exception as error:
+        with host_tasks_lock:
+            state = host_tasks.get(task_id)
+            if state is not None:
+                state["status"] = "failed"
+                state["asideStatus"] = "errored"
+                state["error"] = str(error)
+                state["updatedAt"] = int(time.time())
+                snapshot = dict(state)
+            else:
+                snapshot = None
+        if snapshot is not None:
+            save_host_task(snapshot)
+        return
+    with host_tasks_lock:
+        state = host_tasks.get(task_id)
+        if state is not None:
+            state["status"] = "succeeded"
+            state["asideStatus"] = "idle"
+            state["raw"] = result
+            state["result"] = result
+            state["updatedAt"] = int(time.time())
+            snapshot = dict(state)
+        else:
+            snapshot = None
+    if snapshot is not None:
+        save_host_task(snapshot)
+
+
+def list_aside_hosts(account: Optional[str] = None) -> Dict[str, Any]:
+    command = [aside_command(), "host", "list", "--json"]
+    if account is not None:
+        if not re.fullmatch(r"u\d+", account):
+            raise ValueError("account must look like u0")
+        command.extend(["--account", account])
+    result = subprocess.run(
+        command,
+        cwd=str(ROOT),
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    if result.returncode != 0:
+        detail = strip_ansi(result.stderr).strip()
+        raise RuntimeError(detail or "aside host list failed")
+    try:
+        payload = json.loads(result.stdout)
+    except json.JSONDecodeError as error:
+        raise RuntimeError("aside host list returned invalid JSON") from error
+    if not isinstance(payload, dict) or not isinstance(payload.get("hosts"), list):
+        raise RuntimeError("aside host list returned an invalid response")
+    return payload
+
+
 def _drain_task_process(process: subprocess.Popen) -> None:
     try:
         if process.stderr is not None:
@@ -351,6 +514,9 @@ def _drain_task_process(process: subprocess.Popen) -> None:
 def read_task(task_id: str, account: Optional[str] = None) -> Dict[str, Any]:
     if not re.fullmatch(r"[A-Za-z0-9_-]{8,64}", task_id):
         raise ValueError("invalid task id")
+    state = read_host_task(task_id)
+    if state is not None:
+        return state
     database = state_db_path(account)
     if not database.is_file():
         raise FileNotFoundError("Aside session state is not available")
@@ -363,19 +529,22 @@ def read_task(task_id: str, account: Optional[str] = None) -> Dict[str, Any]:
             (task_id,),
         ).fetchone()
         if session is None:
-            raise LookupError(task_id)
-        turn = connection.execute(
-            """
-            SELECT final_assistant_message, abort_reason, finished_at, aborted_at
-            FROM session_turns
-            WHERE session_id = ?
-            ORDER BY id DESC
-            LIMIT 1
-            """,
-            (task_id,),
-        ).fetchone()
+            turn = None
+        else:
+            turn = connection.execute(
+                """
+                SELECT final_assistant_message, abort_reason, finished_at, aborted_at
+                FROM session_turns
+                WHERE session_id = ?
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (task_id,),
+            ).fetchone()
     finally:
         connection.close()
+    if session is None:
+        raise LookupError(task_id)
     return task_payload(session, turn)
 
 
@@ -654,6 +823,7 @@ class Handler(SimpleHTTPRequestHandler):
             "/mcp",
             "/v1/models",
             "/v1/chat/completions",
+            "/v1/hosts",
             "/v1/tasks",
         } and not path.startswith("/v1/tasks/"):
             self.send_error(HTTPStatus.NOT_FOUND)
@@ -678,6 +848,9 @@ class Handler(SimpleHTTPRequestHandler):
             return
         if path.startswith("/v1/tasks/"):
             self._handle_get_task()
+            return
+        if path == "/v1/hosts":
+            self._handle_get_hosts()
             return
         if path == "/v1/models":
             if not self._authorized():
@@ -843,8 +1016,51 @@ class Handler(SimpleHTTPRequestHandler):
         if account is not None and not isinstance(account, str):
             self._send_openai_error("account must be a string")
             return
+        if account and not re.fullmatch(r"u\d+", account):
+            self._send_openai_error("account must look like u0")
+            return
+        prompt = request.get("prompt")
+        if not isinstance(prompt, str) or not prompt.strip():
+            self._send_openai_error("prompt is required")
+            return
+        if "host" in request and "hosts" in request:
+            self._send_openai_error("host and hosts cannot be used together")
+            return
+        host = request.get("host")
+        if "host" in request and (not isinstance(host, str) or not host.strip()):
+            self._send_openai_error("host must be a non-empty string")
+            return
+        hosts = request.get("hosts")
+        if "hosts" in request:
+            if not isinstance(hosts, list) or not hosts:
+                self._send_openai_error("hosts must be a non-empty array")
+                return
+            if len(hosts) > MAX_TASK_HOSTS:
+                self._send_openai_error(f"hosts may contain at most {MAX_TASK_HOSTS} entries")
+                return
+            if any(not isinstance(item, str) or not item.strip() for item in hosts):
+                self._send_openai_error("each host must be a non-empty string")
+                return
+            hosts = [item.strip() for item in hosts]
+            if len(set(hosts)) != len(hosts):
+                self._send_openai_error("hosts must not contain duplicates")
+                return
+        elif host is not None:
+            host = host.strip()
+
+        if "hosts" in request:
+            tasks = self._start_tasks_on_hosts(prompt, account, hosts)
+            if any(task["status"] == "running" for task in tasks):
+                status = HTTPStatus.ACCEPTED
+            else:
+                status = HTTPStatus.BAD_GATEWAY
+            self._send_json({"tasks": tasks}, status)
+            return
         try:
-            task_id = start_aside_exec(request.get("prompt"), account)
+            if host is None:
+                task_id = start_aside_exec(prompt, account)
+            else:
+                task_id = start_host_task(prompt, account, host)
         except ValueError as error:
             self._send_openai_error(str(error))
             return
@@ -859,7 +1075,60 @@ class Handler(SimpleHTTPRequestHandler):
                 "upstream_error",
             )
             return
-        self._send_json({"taskId": task_id, "status": "running"}, HTTPStatus.ACCEPTED)
+        payload = {"taskId": task_id, "status": "running"}
+        if host is not None:
+            payload["host"] = host
+        self._send_json(payload, HTTPStatus.ACCEPTED)
+
+    def _start_tasks_on_hosts(
+        self,
+        prompt: str,
+        account: Optional[str],
+        hosts: list[str],
+    ) -> list[Dict[str, str]]:
+        tasks = []
+        for host in hosts:
+            try:
+                task_id = start_host_task(prompt, account, host)
+                tasks.append({"host": host, "taskId": task_id, "status": "running"})
+            except Exception as error:
+                print(f"task start failed for host {host}: {error}", flush=True)
+                tasks.append(
+                    {
+                        "host": host,
+                        "status": "failed",
+                        "error": "Aside Host 작업을 시작하지 못했습니다.",
+                    }
+                )
+        return tasks
+
+    def _handle_get_hosts(self) -> None:
+        if not self._authorized():
+            self._send_openai_error("unauthorized", HTTPStatus.UNAUTHORIZED, "authentication_error")
+            return
+        query = parse_qs(urlsplit(self.path).query, keep_blank_values=True)
+        accounts = query.get("account", [])
+        if len(accounts) > 1:
+            self._send_openai_error("account may only be specified once")
+            return
+        account = accounts[0] if accounts else None
+        try:
+            payload = list_aside_hosts(account)
+        except ValueError as error:
+            self._send_openai_error(str(error))
+            return
+        except subprocess.TimeoutExpired:
+            self._send_openai_error("Aside Host 목록 조회 시간이 초과됐습니다.", HTTPStatus.GATEWAY_TIMEOUT, "timeout")
+            return
+        except Exception as error:
+            print(f"host list failed: {error}", flush=True)
+            self._send_openai_error(
+                "Aside Host 목록을 가져오지 못했습니다.",
+                HTTPStatus.BAD_GATEWAY,
+                "upstream_error",
+            )
+            return
+        self._send_json(payload)
 
     def _handle_get_task(self) -> None:
         if not self._authorized():
@@ -1030,6 +1299,7 @@ def main() -> None:
 
     signal.signal(signal.SIGTERM, stop_service)
     os.chdir(ROOT)
+    initialize_host_task_store()
     server = Server((args.host, args.port), Handler)
     print(f"Aside MCP Remote listening on {args.host}:{args.port}", flush=True)
     try:

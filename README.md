@@ -61,6 +61,7 @@ The demo page is served at `http://127.0.0.1:8766/` and the MCP endpoint is
 | `MCP_CORS_ORIGIN` | empty | Optional CORS origin for browser clients |
 | `OPENAI_MODEL` | `aside-browser` | Model ID exposed by `/v1` |
 | `OPENAI_PROGRESS_MESSAGE` | `요청을 처리하고 있어요.` | First streamed status chunk |
+| `HOST_TASK_STATE_DB` | `~/.aside-mcp-remote/tasks.db` | Persistent status and result store for Host tasks |
 
 For a remote deployment, set `MCP_BEARER_TOKEN`. The MCP endpoint can execute
 browser actions and search user memory, so leaving it unauthenticated is only
@@ -116,9 +117,20 @@ function calling; browser work is performed through Aside's `exec` tool.
 ## Tasks API
 
 Long-running browser work can be started without waiting for Aside to finish.
-`POST /v1/tasks` starts `aside exec` and returns the Aside session id as
-`taskId` as soon as the session is created. Poll `GET /v1/tasks/{taskId}` for
-the result. `/v1/chat/completions` remains synchronous.
+`POST /v1/tasks` returns a `taskId` immediately. Tasks without a Host use the
+Aside session id; Host tasks use a bridge id and run through the Host-routed
+MCP `exec` tool. Poll `GET /v1/tasks/{taskId}` for the result.
+`/v1/chat/completions` remains synchronous.
+
+List the available Aside Hosts, including each Host's online state:
+
+```sh
+curl http://127.0.0.1:8766/v1/hosts
+```
+
+The response is the JSON output from `aside host list --json`. Use a Host's
+`id` or `deviceName` as the `host` value. The optional `account` query selects
+the Aside profile, for example `/v1/hosts?account=u1`.
 
 ```sh
 curl http://127.0.0.1:8766/v1/tasks \
@@ -136,15 +148,40 @@ curl http://127.0.0.1:8766/v1/tasks/ses_01HQ7B
 
 The status response uses `running`, `succeeded`, `failed`, or `interrupted`.
 `succeeded` includes the extracted final text in `result` and Aside's stored
-message in `raw`. Pass `account` in the
+message (or Host tool response) in `raw`. Pass `account` in the
 create body, or `?account=u1` on the status request, when the task belongs to
 a non-default Aside profile.
+
+To run a task on one Host, add `host` to the request:
+
+```sh
+curl http://127.0.0.1:8766/v1/tasks \
+  -H 'Content-Type: application/json' \
+  -d '{"prompt": "이 서버의 운영체제를 확인해줘", "host": "gs-aside-worker01"}'
+```
+
+To start the same prompt on several Hosts at once, pass a `hosts` array (up to
+20 Host IDs or names):
+
+```sh
+curl http://127.0.0.1:8766/v1/tasks \
+  -H 'Content-Type: application/json' \
+  -d '{"prompt": "이 서버의 운영체제를 확인해줘", "hosts": ["gs-aside-worker01", "air-13.local"]}'
+```
+
+The batch response contains one entry per Host with its `taskId` and initial
+`status`. Hosts run independently. If a Host fails to connect or execute, its
+polling response changes to `status: "failed"` and includes an `error`. A
+batch returns HTTP 202 if at least one task is scheduled, or HTTP 502 if none
+are. Host task state and results persist in `HOST_TASK_STATE_DB`; tasks that
+were still running when the service restarted are returned as
+`status: "interrupted"`.
 
 ## Security
 
 This service is a protocol bridge, not an authentication boundary by itself.
 Do not commit tokens, browser profiles, cookies, memory files, logs, or `.env`
-files. `MCP_BEARER_TOKEN` protects `/mcp`, `/v1/chat/completions`, and `/v1/tasks`. Use HTTPS and a
+files. `MCP_BEARER_TOKEN` protects `/mcp`, `/v1/chat/completions`, `/v1/hosts`, and `/v1/tasks`. Use HTTPS and a
 non-empty token before exposing either endpoint beyond a trusted network.
 Keep the endpoint behind a reverse proxy with rate limits in production.
 
