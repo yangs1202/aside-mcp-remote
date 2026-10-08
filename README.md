@@ -7,7 +7,7 @@ standard Streamable HTTP endpoint.
 MCP client
     │  JSON-RPC over HTTP
     ▼
-/mcp  ──  this bridge
+/mcp or /{hostName}/mcp  ──  this bridge
     │  JSON-RPC over stdio
     ▼
 aside mcp  ──  Aside Browser
@@ -57,15 +57,15 @@ The demo page is served at `http://127.0.0.1:8766/` and the MCP endpoint is
 | `ASIDE_BIN` | `aside` from `PATH` | Path to the Aside CLI |
 | `PORT` | `8766` | Default HTTP port |
 | `MCP_REQUEST_TIMEOUT_SECONDS` | `180` | Maximum wait for a tool call |
-| `MCP_BEARER_TOKEN` | empty | Optional bearer token for `/mcp` |
+| `MCP_BEARER_TOKEN` | empty | Optional bearer token for MCP endpoints |
 | `MCP_CORS_ORIGIN` | empty | Optional CORS origin for browser clients |
 | `OPENAI_MODEL` | `aside-browser` | Model ID exposed by `/v1` |
 | `OPENAI_PROGRESS_MESSAGE` | `요청을 처리하고 있어요.` | First streamed status chunk |
 | `HOST_TASK_STATE_DB` | `~/.aside-mcp-remote/tasks.db` | Persistent status and result store for Host tasks |
 
 For a remote deployment, set `MCP_BEARER_TOKEN`. The MCP endpoint can execute
-browser actions and search user memory, so leaving it unauthenticated is only
-appropriate for a trusted local POC.
+browser actions and search user memory, so leaving MCP endpoints unauthenticated
+is only appropriate for a trusted local POC.
 
 ## MCP client example
 
@@ -75,13 +75,24 @@ Configure a Streamable HTTP MCP client with:
 http://host.example:8766/mcp
 ```
 
+This legacy path continues to use the local Aside instance. To use a configured
+Aside Host, use its name or ID as the first path segment:
+
+```text
+http://host.example:8766/gs-aside-worker01/mcp
+```
+
+Host names are listed by `GET /v1/hosts`. Keep the same MCP URL for initialize,
+notifications, tool calls, and session deletion.
+
 When authentication is enabled, send:
 
 ```http
 Authorization: Bearer <MCP_BEARER_TOKEN>
 ```
 
-The endpoint uses the standard session flow:
+The endpoint uses the standard session flow. For the Host example, replace
+`/mcp` in each path below with `/gs-aside-worker01/mcp`:
 
 1. `POST /mcp` with `initialize`
 2. `POST /mcp` with `notifications/initialized`
@@ -181,8 +192,9 @@ were still running when the service restarted are returned as
 
 This service is a protocol bridge, not an authentication boundary by itself.
 Do not commit tokens, browser profiles, cookies, memory files, logs, or `.env`
-files. `MCP_BEARER_TOKEN` protects `/mcp`, `/v1/chat/completions`, `/v1/hosts`, and `/v1/tasks`. Use HTTPS and a
-non-empty token before exposing either endpoint beyond a trusted network.
+files. `MCP_BEARER_TOKEN` protects both MCP routes and the `/v1` API endpoints.
+Use HTTPS and a non-empty token before exposing the service beyond a trusted
+network.
 Keep the endpoint behind a reverse proxy with rate limits in production.
 
 ## License

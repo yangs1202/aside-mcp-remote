@@ -18,7 +18,7 @@ from http import HTTPStatus
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Dict, Optional
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
 
 
 ROOT = Path(__file__).resolve().parent
@@ -59,6 +59,7 @@ class AsideMcpSession:
     """Keep one ``aside mcp`` stdio server per HTTP MCP session."""
 
     def __init__(self, account: Optional[str] = None, host: Optional[str] = None) -> None:
+        self.host = host
         command = [aside_command(), "mcp"]
         if account:
             command.extend(["--account", account])
@@ -705,6 +706,23 @@ sessions: Dict[str, AsideMcpSession] = {}
 sessions_lock = threading.Lock()
 
 
+def mcp_route(path: str) -> tuple[bool, Optional[str]]:
+    if path == "/mcp":
+        return True, None
+    if not path.startswith("/") or not path.endswith("/mcp"):
+        return False, None
+    encoded_host = path[1:-4]
+    if not encoded_host or "/" in encoded_host:
+        return False, None
+    try:
+        host = unquote(encoded_host, errors="strict")
+    except UnicodeDecodeError:
+        return False, None
+    if not host or "/" in host or "\x00" in host:
+        return False, None
+    return True, host
+
+
 def close_session(session_id: str) -> None:
     with sessions_lock:
         session = sessions.pop(session_id, None)
@@ -819,8 +837,8 @@ class Handler(SimpleHTTPRequestHandler):
 
     def do_OPTIONS(self) -> None:
         path = urlsplit(self.path).path
-        if path not in {
-            "/mcp",
+        is_mcp_route, _ = mcp_route(path)
+        if not is_mcp_route and path not in {
             "/v1/models",
             "/v1/chat/completions",
             "/v1/hosts",
@@ -835,6 +853,7 @@ class Handler(SimpleHTTPRequestHandler):
 
     def do_GET(self) -> None:
         path = urlsplit(self.path).path
+        is_mcp_endpoint, _ = mcp_route(path)
         if path == "/api/status":
             with sessions_lock:
                 session_count = len(sessions)
@@ -858,7 +877,7 @@ class Handler(SimpleHTTPRequestHandler):
                 return
             self._send_json({"object": "list", "data": available_models()})
             return
-        if path == "/mcp":
+        if is_mcp_endpoint:
             self.send_response(HTTPStatus.METHOD_NOT_ALLOWED)
             self.send_header("Allow", "POST, DELETE")
             self.send_header("Content-Length", "0")
@@ -871,7 +890,8 @@ class Handler(SimpleHTTPRequestHandler):
         super().do_GET()
 
     def do_DELETE(self) -> None:
-        if urlsplit(self.path).path != "/mcp":
+        is_mcp_endpoint, route_host = mcp_route(urlsplit(self.path).path)
+        if not is_mcp_endpoint:
             self.send_error(HTTPStatus.NOT_FOUND)
             return
         if not self._authorized():
@@ -881,8 +901,15 @@ class Handler(SimpleHTTPRequestHandler):
         if not session_id:
             self.send_error(HTTPStatus.BAD_REQUEST, "Mcp-Session-Id is required")
             return
-        if get_session(session_id) is None:
+        session = get_session(session_id)
+        if session is None:
             self._send_json({"error": "MCP session not found"}, HTTPStatus.NOT_FOUND)
+            return
+        if session.host != route_host:
+            self._send_json(
+                {"error": "Mcp-Session-Id does not belong to this MCP route"},
+                HTTPStatus.BAD_REQUEST,
+            )
             return
         close_session(session_id)
         self.send_response(HTTPStatus.NO_CONTENT)
@@ -892,13 +919,14 @@ class Handler(SimpleHTTPRequestHandler):
 
     def do_POST(self) -> None:
         path = urlsplit(self.path).path
+        is_mcp_endpoint, route_host = mcp_route(path)
         if path == "/v1/chat/completions":
             self._handle_chat_completions()
             return
         if path == "/v1/tasks":
             self._handle_create_task()
             return
-        if path != "/mcp":
+        if not is_mcp_endpoint:
             self.send_error(HTTPStatus.NOT_FOUND)
             return
         if not self._authorized():
@@ -932,7 +960,7 @@ class Handler(SimpleHTTPRequestHandler):
                         self._send_json({"error": "MCP session capacity reached; retry later"},
                                         HTTPStatus.SERVICE_UNAVAILABLE)
                         return
-                    session = AsideMcpSession()
+                    session = AsideMcpSession(host=route_host)
                     sessions[session_id] = session
             except OSError:
                 self._send_json({"error": "Unable to start MCP process; retry later"},
@@ -956,6 +984,12 @@ class Handler(SimpleHTTPRequestHandler):
         if session is None:
             self._send_json(
                 {"error": "valid Mcp-Session-Id is required"},
+                HTTPStatus.BAD_REQUEST,
+            )
+            return
+        if session.host != route_host:
+            self._send_json(
+                {"error": "Mcp-Session-Id does not belong to this MCP route"},
                 HTTPStatus.BAD_REQUEST,
             )
             return

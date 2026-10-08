@@ -455,5 +455,141 @@ class AsideCommandTest(unittest.TestCase):
         self.assertIn("재시작", interrupted["error"])
 
 
+class McpRoutesTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.httpd = server.Server(("127.0.0.1", 0), server.Handler)
+        cls.thread = threading.Thread(target=cls.httpd.serve_forever, daemon=True)
+        cls.thread.start()
+        cls.base_url = f"http://127.0.0.1:{cls.httpd.server_port}"
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.httpd.shutdown()
+        cls.httpd.server_close()
+        cls.thread.join(timeout=2)
+
+    def setUp(self):
+        with server.sessions_lock:
+            server.sessions.clear()
+
+    def tearDown(self):
+        with server.sessions_lock:
+            session_ids = list(server.sessions)
+        for session_id in session_ids:
+            server.close_session(session_id)
+
+    def request(self, path, method, payload=None, headers=None):
+        data = None
+        request_headers = dict(headers or {})
+        if payload is not None:
+            data = json.dumps(payload).encode("utf-8")
+            request_headers["Content-Type"] = "application/json"
+        request = urllib.request.Request(
+            self.base_url + path,
+            data=data,
+            headers=request_headers,
+            method=method,
+        )
+        return urllib.request.urlopen(request, timeout=5)
+
+    @staticmethod
+    def make_session(host):
+        session = mock.Mock()
+        session.host = host
+        session.request.side_effect = lambda message: {
+            "jsonrpc": "2.0",
+            "id": message.get("id"),
+            "result": {"ok": True},
+        }
+        return session
+
+    def test_legacy_mcp_path_keeps_session_local(self):
+        session = self.make_session(None)
+        with mock.patch.object(server, "AsideMcpSession", return_value=session) as create:
+            with self.request(
+                "/mcp",
+                "POST",
+                {"jsonrpc": "2.0", "id": 1, "method": "initialize"},
+            ) as response:
+                session_id = response.headers["Mcp-Session-Id"]
+            with self.request(
+                "/mcp",
+                "POST",
+                {"jsonrpc": "2.0", "id": 2, "method": "tools/list"},
+                {"Mcp-Session-Id": session_id},
+            ) as response:
+                body = json.loads(response.read())
+
+        create.assert_called_once_with(host=None)
+        self.assertIsNone(session.host)
+        self.assertEqual(body["id"], 2)
+
+    def test_host_route_keeps_requests_and_delete_on_selected_host(self):
+        host = "gs-aside-worker01"
+        path = f"/{host}/mcp"
+        session = self.make_session(host)
+        with mock.patch.object(server, "AsideMcpSession", return_value=session) as create:
+            with self.request(
+                path,
+                "POST",
+                {"jsonrpc": "2.0", "id": 1, "method": "initialize"},
+            ) as response:
+                session_id = response.headers["Mcp-Session-Id"]
+
+            with self.request(
+                path,
+                "POST",
+                {"jsonrpc": "2.0", "method": "notifications/initialized"},
+                {"Mcp-Session-Id": session_id},
+            ) as response:
+                self.assertEqual(response.status, 202)
+
+            with self.request(
+                path,
+                "POST",
+                {"jsonrpc": "2.0", "id": 2, "method": "tools/list"},
+                {"Mcp-Session-Id": session_id},
+            ) as response:
+                self.assertEqual(json.loads(response.read())["id"], 2)
+
+            with self.assertRaises(urllib.error.HTTPError) as context:
+                self.request(
+                    "/mcp",
+                    "POST",
+                    {"jsonrpc": "2.0", "id": 3, "method": "tools/list"},
+                    {"Mcp-Session-Id": session_id},
+                )
+            self.assertEqual(context.exception.code, 400)
+
+            with self.assertRaises(urllib.error.HTTPError) as context:
+                self.request(
+                    "/another-host/mcp",
+                    "DELETE",
+                    headers={"Mcp-Session-Id": session_id},
+                )
+            self.assertEqual(context.exception.code, 400)
+            self.assertIn(session_id, server.sessions)
+
+            with self.request(
+                path,
+                "DELETE",
+                headers={"Mcp-Session-Id": session_id},
+            ) as response:
+                self.assertEqual(response.status, 204)
+
+        create.assert_called_once_with(host=host)
+        session.notify.assert_called_once_with(
+            {"jsonrpc": "2.0", "method": "notifications/initialized"}
+        )
+        session.close.assert_called_once_with()
+
+    def test_host_route_supports_options_and_rejects_encoded_slash(self):
+        with self.request("/worker-one/mcp", "OPTIONS") as response:
+            self.assertEqual(response.status, 204)
+        self.assertEqual(server.mcp_route("/worker%2Ftwo/mcp"), (False, None))
+        self.assertEqual(server.mcp_route("/worker/child/mcp"), (False, None))
+
+
 if __name__ == "__main__":
     unittest.main()
