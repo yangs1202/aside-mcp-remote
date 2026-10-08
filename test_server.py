@@ -497,6 +497,9 @@ class McpRoutesTest(unittest.TestCase):
     def make_session(host):
         session = mock.Mock()
         session.host = host
+        session.lock = threading.RLock()
+        session.last_used = server.time.monotonic()
+        session.process.poll.return_value = None
         session.request.side_effect = lambda message: {
             "jsonrpc": "2.0",
             "id": message.get("id"),

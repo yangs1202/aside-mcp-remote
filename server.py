@@ -1109,7 +1109,10 @@ class Handler(SimpleHTTPRequestHandler):
             return
         try:
             if host is None:
-                task_id = start_aside_exec(prompt, account, execution_model)
+                if execution_model is None:
+                    task_id = start_aside_exec(prompt, account)
+                else:
+                    task_id = start_aside_exec(prompt, account, execution_model)
             else:
                 task_id = start_host_task(prompt, account, host)
         except ValueError as error:
